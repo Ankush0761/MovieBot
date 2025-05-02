@@ -1,112 +1,141 @@
-from flask import Flask
-import threading, os
+import os
+import threading
+import requests
 import telebot
+from telebot.types import InlineQueryResultArticle, InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
 from pymongo import MongoClient
+from fuzzywuzzy import process
+from flask import Flask
+from dotenv import load_dotenv
 
-# === CONFIGURATION ===
-API_TOKEN        = '7702090142:AAF0Ji1ERwbT3bwE5PPiu33zSUlh-P2UHpk'  # Your Bot Token
-ADMIN_ID         = 8075098988                                   # Your Telegram User ID
-MONGO_URI        = 'mongodb+srv://deybarun176:JNIj1Yy45xOzx4Av@barun.7t6nu9s.mongodb.net/?retryWrites=true&w=majority&appName=Barun'
-MOVIE_CHANNEL_ID = -1002605645508    # Movie Store channel ID
-LOG_CHANNEL_ID   = -1002661190627    # Log channel ID
+# === Load environment variables ===
+load_dotenv()
+API_TOKEN        = os.getenv("API_TOKEN")
+ADMIN_ID         = int(os.getenv("ADMIN_ID"))
+MONGO_URI        = os.getenv("MONGO_URI")
+OMDB_API_KEY     = os.getenv("OMDB_API_KEY")
+MOVIE_CHANNEL_ID = int(os.getenv("MOVIE_CHANNEL_ID"))
+LOG_CHANNEL_ID   = int(os.getenv("LOG_CHANNEL_ID"))
 
-# === SETUP ===
+# === Initialize Bot, DB, Flask ===
 bot = telebot.TeleBot(API_TOKEN)
 client = MongoClient(MONGO_URI)
 db = client['moviebot']
 col = db['movies']
+app = Flask(__name__)
 
-# === /start COMMAND ===
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    text = (
-        "👋 Welcome to MovieBot!\n"
-        "🎥 Just type the exact movie name to get the file."
-    )
-    bot.send_message(message.chat.id, text)
+# === Utility: Fetch metadata from OMDB ===
+def fetch_metadata(title):
+    try:
+        resp = requests.get(
+            f"http://www.omdbapi.com/", params={"t": title, "apikey": OMDB_API_KEY}
+        )
+        data = resp.json()
+        return {
+            "rating": data.get("imdbRating", "N/A"),
+            "genre": data.get("Genre", ""),
+            "poster": data.get("Poster", None)
+        }
+    except:
+        return {"rating": "N/A", "genre": "", "poster": None}
 
-# === AUTO-ADD HANDLER FOR MOVIE CHANNEL ===
-@bot.message_handler(content_types=['document', 'video', 'audio'])
-def handle_channel_post(message):
-    # Only process in Movie Store channel
-    if message.chat.id != MOVIE_CHANNEL_ID:
+# === Inline Search Handler ===
+@bot.inline_handler(lambda query: True)
+def inline_search(inline_query):
+    q = inline_query.query.strip().lower()
+    if not q:
         return
-    caption = message.caption or ''
+    # Fuzzy match top 5
+    all_names = [doc['name'] for doc in col.find()]
+    matches = process.extract(q, all_names, limit=5)
+    results = []
+    for name, score in matches:
+        if score < 50:
+            continue
+        doc = col.find_one({'name': name})
+        meta = fetch_metadata(name)
+        title = doc['name'].title()
+        description = f"{doc['year']} | IMDb: {meta['rating']} | {meta['genre']}"
+        content = InputTextMessageContent(f"/watch {title}")
+        button = InlineKeyboardButton("Get Movie", callback_data=f"WATCH|{name}")
+        markup = InlineKeyboardMarkup().add(button)
+        result = InlineQueryResultArticle(
+            id=name,
+            title=title,
+            description=description,
+            input_message_content=content,
+            reply_markup=markup
+        )
+        results.append(result)
+    bot.answer_inline_query(inline_query.id, results)
+
+# === /watch Command or Callback ===
+@bot.message_handler(commands=['watch'])
+def watch_cmd(msg):
+    name = msg.text.split(' ',1)[1].strip().lower()
+    send_movie_or_suggest(msg.chat.id, name)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('WATCH|'))
+def callback_watch(call):
+    _, name = call.data.split('|',1)
+    send_movie_or_suggest(call.message.chat.id, name)
+
+# === Send movie or suggestions ===
+def send_movie_or_suggest(chat_id, name):
+    doc = col.find_one({'name': {'$regex': f'^{name}$'}})
+    if doc:
+        bot.forward_message(chat_id, doc['chat_id'], doc['message_id'])
+    else:
+        # Suggest top 3
+        all_names = [d['name'] for d in col.find()]
+        suggestions = process.extract(name, all_names, limit=3)
+        text = "❌ Movie not found. Did you mean?\n"
+        for s, _ in suggestions:
+            text += f"• {s.title()}\n"
+        bot.send_message(chat_id, text)
+
+# === Auto-add Handler (Movie Channel) ===
+@bot.message_handler(content_types=['document', 'video', 'audio'])
+def auto_add(m):
+    if m.chat.id != MOVIE_CHANNEL_ID:
+        return
+    caption = m.caption or ''
     if '|' not in caption:
         return
-    name_part, year_part = [p.strip() for p in caption.split('|', 1)]
-    if not name_part or not year_part:
+    name, year = [p.strip() for p in caption.split('|',1)]
+    # Prevent duplicates
+    if col.find_one({'chat_id': MOVIE_CHANNEL_ID, 'message_id': m.message_id}):
         return
-    name = name_part.lower()
-    year = year_part
-    # Avoid duplicates
-    exists = col.find_one({'chat_id': MOVIE_CHANNEL_ID, 'message_id': message.message_id})
-    if exists:
-        return
-    # Insert into DB
     col.insert_one({
-        'name': name,
-        'year': year,
-        'chat_id': MOVIE_CHANNEL_ID,
-        'message_id': message.message_id
+        'name': name.lower(), 'year': year,
+        'chat_id': MOVIE_CHANNEL_ID, 'message_id': m.message_id
     })
-    # Log to Log Channel
-    log_text = f"✅ New movie added: *{name_part}* ({year_part})"
-    bot.send_message(LOG_CHANNEL_ID, log_text, parse_mode='Markdown')
+    bot.send_message(LOG_CHANNEL_ID, f"✅ Added: *{name}* ({year})", parse_mode='Markdown')
 
-# === /delmovie COMMAND ===
+# === /delmovie Command ===
 @bot.message_handler(commands=['delmovie'])
-def handle_delmovie(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "⛔ You are not authorized to delete movies.")
-        return
-    parts = message.text.split(' ', 1)
-    if len(parts) < 2:
-        bot.reply_to(message, "⚠️ Usage: /delmovie Movie Name")
-        return
-    name_query = parts[1].strip().lower()
-    doc = col.find_one({'name': name_query})
+def delete_movie(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return bot.reply_to(msg, "⛔ Not authorized.")
+    name = msg.text.split(' ',1)[1].strip().lower()
+    doc = col.find_one({'name': name})
     if not doc:
-        bot.reply_to(message, "❌ Movie not found.")
-        return
-    # Delete DB record
+        return bot.reply_to(msg, "❌ Movie not found.")
     col.delete_one({'_id': doc['_id']})
-    # Optionally delete from channel
-    try:
-        bot.delete_message(doc['chat_id'], doc['message_id'])
-    except Exception:
-        pass
-    # Log deletion
-    bot.send_message(LOG_CHANNEL_ID,
-                     f"🗑️ Deleted: *{name_query.title()}*",
-                     parse_mode='Markdown')
-    bot.reply_to(message,
-                 f"🗑️ Movie *{name_query.title()}* deleted.",
-                 parse_mode='Markdown')
+    try: bot.delete_message(doc['chat_id'], doc['message_id'])
+    except: pass
+    bot.send_message(LOG_CHANNEL_ID, f"🗑️ Deleted: *{name.title()}*", parse_mode='Markdown')
+    bot.reply_to(msg, f"🗑️ Movie *{name.title()}* deleted.")
 
-# === DIRECT TEXT HANDLER FOR MOVIE SEARCH ===
-@bot.message_handler(func=lambda m: m.content_type == 'text' and not m.text.startswith('/'), content_types=['text'])
-def handle_movie_search(message):
-    name_query = message.text.strip().lower()
-    doc = col.find_one({'name': name_query})
-    if doc:
-        bot.forward_message(message.chat.id, doc['chat_id'], doc['message_id'])
-    else:
-        bot.reply_to(message, "❌ Movie not found. Please type the exact name.")
-
-# === FLASK HEALTHCHECK ===
-app = Flask(__name__)
+# === Flask Healthcheck ===
 @app.route('/')
-def health_check():
-    return 'OK'
+def health(): return 'OK'
 
-# === RUN BOT AND FLASK ===
-def run_bot():
+# === Run ===
+def run():
     bot.infinity_polling()
-
+    
 if __name__ == '__main__':
-    # Start bot polling in a separate thread
-    threading.Thread(target=run_bot).start()
-    # Run Flask app for healthchecks
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port)
+    # Start bot and Flask
+    threading.Thread(target=run).start()
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT',8000)))
